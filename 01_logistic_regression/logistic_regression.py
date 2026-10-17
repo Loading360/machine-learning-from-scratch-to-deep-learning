@@ -68,8 +68,8 @@ print("F1-score :", f1_score(y_test, pred_train))                    # Le f1_sco
 # On prépare les 5 batchs de validations qui serviront à tester le modèle : 
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-S_values = [0.05 * i for i in range(1, 10,2)]
-C_values = [0.1 * i for i in range(1, 40, 5)]
+S_values = [0.01 * i for i in range(1, 12,2)]
+C_values = [0.1 * i for i in range(1, 20, 2)]
 
 score_validation_liste = []
 
