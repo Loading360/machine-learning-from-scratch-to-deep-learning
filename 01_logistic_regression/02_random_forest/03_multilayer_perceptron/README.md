@@ -1,1 +1,0 @@
-# Part III — Multilayer Perceptron
