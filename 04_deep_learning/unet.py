@@ -1,7 +1,7 @@
 """U-Net baseline for Kaggle Ultrasound Nerve Segmentation.
 
 Download the labeled training images separately. Do not commit the dataset.
-Run: python 04_deep_learning/unet.py --data-dir /path/to/train --epochs 2
+Run: python 04_deep_learning/unet.py --data-dir /path/to/train --epochs 3
 """
 from pathlib import Path
 import argparse
@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import GroupShuffleSplit
 
 
@@ -115,25 +115,70 @@ def dice_per_image(logits, targets, eps=1e-7):
     return (2 * intersection + eps) / (denominator + eps)
 
 
+def combined_loss(logits, targets):
+    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets)
+    probs = torch.sigmoid(logits)
+    dims = (1, 2, 3)
+    intersection = (probs * targets).sum(dim=dims)
+    denominator = probs.sum(dim=dims) + targets.sum(dim=dims)
+    soft_dice = (2 * intersection + 1e-6) / (denominator + 1e-6)
+    return bce + (1 - soft_dice.mean())
+
+
+def balanced_sampler(mask_paths):
+    flags = []
+    for path in mask_paths:
+        with Image.open(path) as im:
+            flags.append(bool(np.any(np.asarray(im) > 0)))
+    flags = np.asarray(flags, dtype=bool)
+    n_pos = int(flags.sum())
+    n_neg = len(flags) - n_pos
+    if not n_pos or not n_neg:
+        raise ValueError("Training set needs both positive and empty masks")
+    print("Training masks:", n_pos, "positive,", n_neg, "empty")
+    weights = np.where(flags, 1 / n_pos, 1 / n_neg)
+    return WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(flags),
+        replacement=True,
+    )
+
+
 def evaluate(model, loader, loss_fn, device):
     model.eval()
-    total_loss, total_dice, total_n = 0.0, 0.0, 0
+    total_loss, total_n = 0.0, 0
+    all_dice, positive_dice = [], []
+    positive_n = detected_n = empty_n = correctly_empty_n = 0
     with torch.no_grad():
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             logits = model(x)
-            n = len(x)
-            total_loss += loss_fn(logits, y).item() * n
-            total_dice += dice_per_image(logits, y).sum().item()
-            total_n += n
-    return total_loss / total_n, total_dice / total_n
+            preds = torch.sigmoid(logits) > 0.5
+            real_pos = y.sum(dim=(1, 2, 3)) > 0
+            pred_pos = preds.sum(dim=(1, 2, 3)) > 0
+            dice = dice_per_image(logits, y)
+            all_dice.extend(dice.cpu().tolist())
+            positive_dice.extend(dice[real_pos].cpu().tolist())
+            positive_n += real_pos.sum().item()
+            detected_n += (real_pos & pred_pos).sum().item()
+            empty_n += (~real_pos).sum().item()
+            correctly_empty_n += ((~real_pos) & (~pred_pos)).sum().item()
+            total_loss += loss_fn(logits, y).item() * len(x)
+            total_n += len(x)
+    return {
+        "loss": total_loss / total_n,
+        "dice_all": float(np.mean(all_dice)),
+        "dice_positive": float(np.mean(positive_dice)) if positive_dice else float("nan"),
+        "positive_detection": detected_n / positive_n if positive_n else float("nan"),
+        "empty_correct": correctly_empty_n / empty_n if empty_n else float("nan"),
+    }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="Directory containing image.tif and image_mask.tif pairs")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -167,7 +212,7 @@ def main():
         UltrasoundDataset(*subset, image_size=args.image_size)
         for subset in (train, val, test)
     ]
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=balanced_sampler(train[1]),
                               num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=0)
@@ -175,9 +220,9 @@ def main():
                              num_workers=0)
 
     model = UNet().to(device)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = combined_loss
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    history = {"train_loss": [], "val_loss": [], "val_dice": []}
+    history = {"train_loss": [], "val_loss": [], "val_dice": [], "val_positive_dice": []}
     best_loss, best_weights = float("inf"), None
 
     for epoch in range(args.epochs):
@@ -191,43 +236,56 @@ def main():
             optimizer.step()
             train_loss_sum += loss.item() * len(x)
         train_loss = train_loss_sum / len(train_ds)
-        val_loss, val_dice = evaluate(model, val_loader, loss_fn, device)
+        val_metrics = evaluate(model, val_loader, loss_fn, device)
+        val_loss = val_metrics["loss"]
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
-        history["val_dice"].append(val_dice)
+        history["val_dice"].append(val_metrics["dice_all"])
+        history["val_positive_dice"].append(val_metrics["dice_positive"])
         if val_loss < best_loss:
             best_loss = val_loss
             best_weights = copy.deepcopy(model.state_dict())
-        print(f"Epoch {epoch+1}/{args.epochs} | train BCE {train_loss:.4f} | "
-              f"val BCE {val_loss:.4f} | val Dice {val_dice:.4f}")
+        print(f"Epoch {epoch+1}/{args.epochs} | train loss {train_loss:.4f} | "
+              f"val loss {val_loss:.4f} | val Dice {val_metrics['dice_all']:.4f} | "
+              f"positive Dice {val_metrics['dice_positive']:.4f}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model.load_state_dict(best_weights)
     torch.save(model.state_dict(), args.output_dir / "unet_best.pth")
-    test_loss, test_dice = evaluate(model, test_loader, loss_fn, device)
-    print(f"Test BCE: {test_loss:.4f} | Test Dice: {test_dice:.4f}")
+    test_metrics = evaluate(model, test_loader, loss_fn, device)
+    print("Held-out test metrics:")
+    for key, value in test_metrics.items():
+        print(f"  {key}: {value:.4f}")
 
     fig, ax = plt.subplots()
-    ax.plot(history["train_loss"], label="Train BCE")
-    ax.plot(history["val_loss"], label="Validation BCE")
-    ax.set(xlabel="Epoch", ylabel="BCE loss")
+    ax.plot(history["train_loss"], label="Train BCE + Dice")
+    ax.plot(history["val_loss"], label="Validation BCE + Dice")
+    ax.set(xlabel="Epoch", ylabel="BCE + Dice loss")
     ax.legend()
     fig.savefig(args.output_dir / "loss_curves.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots()
-    ax.plot(history["val_dice"], label="Validation Dice")
+    ax.plot(history["val_dice"], label="Validation Dice (all)")
+    ax.plot(history["val_positive_dice"], label="Validation Dice (positive)")
     ax.set(xlabel="Epoch", ylabel="Dice")
     ax.legend()
     fig.savefig(args.output_dir / "dice_curve.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    n_show = min(3, len(test_ds))
+    positive_indices = []
+    for i in range(len(test_ds)):
+        _, mask = test_ds[i]
+        if mask.sum() > 0:
+            positive_indices.append(i)
+        if len(positive_indices) == 3:
+            break
+    n_show = len(positive_indices)
     fig, axes = plt.subplots(n_show, 3, figsize=(10, 3 * n_show), squeeze=False)
     model.eval()
     with torch.no_grad():
         for i in range(n_show):
-            x, y = test_ds[i]
+            x, y = test_ds[positive_indices[i]]
             logits = model(x.unsqueeze(0).to(device))
             pred = (torch.sigmoid(logits)[0, 0] > 0.5).cpu().numpy()
             for ax, arr, title in zip(
@@ -238,7 +296,7 @@ def main():
                 ax.set_title(title)
                 ax.axis("off")
     fig.tight_layout()
-    fig.savefig(args.output_dir / "predictions.png", dpi=150)
+    fig.savefig(args.output_dir / "positive_predictions.png", dpi=150)
     plt.close(fig)
 
 
